@@ -6763,6 +6763,30 @@ def _aero_table(header, rows):
                       style={**STYLES['param_table'], 'margin': '12px 0 6px 0'})
 
 
+def _aero_add_freq_lines(fig, d, row):
+    """Add the three reference-frequency lines (f_heave, f_mast, f_s) to
+    the column-2 (log-scale frequency) subplot of the given row.
+
+    Labels are added with add_annotation rather than add_vline's built-in
+    annotation: the latter mislocates text on a log x-axis (it treats the
+    raw value as a log coordinate, so x=2 lands at 10**2). The label x is
+    therefore log10(frequency), referenced to the subplot's own axes."""
+    ax = (row - 1) * 2 + 2              # col-2 subplots -> x2 / x4 / x6
+    xref, yref = f'x{ax}', f'y{ax} domain'
+    items = [
+        (d['f_heave'], COLORS['accent'],   'f_heave', 0.93, 'right', -3),
+        (d['f_mast'],  COLORS['alert'],    'f_mast',  0.93, 'left',   3),
+        (d['f_shed'],  COLORS['accent_2'], 'f_s',     0.07, 'left',   3),
+    ]
+    for fx, fc, ft, fy, anc, xsh in items:
+        fig.add_vline(x=fx, line=dict(color=fc, width=1, dash='dash'),
+                      row=row, col=2)
+        fig.add_annotation(
+            x=float(np.log10(fx)), y=fy, xref=xref, yref=yref,
+            text=ft, showarrow=False, font=dict(size=9, color=fc),
+            xanchor=anc, yanchor='middle', xshift=xsh)
+
+
 def _aero_fig_forcing(d):
     """3 rows (gust / vortex / total) x 2 cols (time / frequency)."""
     t = d['t']
@@ -6789,10 +6813,7 @@ def _aero_fig_forcing(d):
         fig.add_trace(go.Scatter(
             x=freqs[fmask], y=d[fkey][fmask], mode='lines',
             line=dict(color=color, width=1.3)), row=row, col=2)
-        fig.add_vline(x=d['f_heave'], line=dict(color=COLORS['accent'],
-                      width=1, dash='dash'), row=row, col=2)
-        fig.add_vline(x=d['f_mast'], line=dict(color=COLORS['alert'],
-                      width=1, dash='dash'), row=row, col=2)
+        _aero_add_freq_lines(fig, d, row)
         fig.update_xaxes(type='log', row=row, col=2)
     fig.update_xaxes(title_text='Time (s)', row=3, col=1)
     fig.update_xaxes(title_text='Frequency (Hz)', row=3, col=2)
@@ -6828,10 +6849,7 @@ def _aero_fig_responses(d):
         fig.add_trace(go.Scatter(
             x=freqs[fmask], y=d[fkey][fmask] * 1000.0, mode='lines',
             line=dict(color=color, width=1.3)), row=row, col=2)
-        fig.add_vline(x=d['f_heave'], line=dict(color=COLORS['accent'],
-                      width=1, dash='dash'), row=row, col=2)
-        fig.add_vline(x=d['f_mast'], line=dict(color=COLORS['alert'],
-                      width=1, dash='dash'), row=row, col=2)
+        _aero_add_freq_lines(fig, d, row)
         fig.update_xaxes(type='log', row=row, col=2)
         fig.update_yaxes(title_text='Displacement (mm)', row=row, col=1)
         fig.update_yaxes(title_text='Amplitude (mm)', row=row, col=2)
@@ -7070,8 +7088,9 @@ def _tab_aero_body(d):
             f"{w['A_mast']:.0f} × {w['U_mean']:.0f}² ≈ "
             f"**{w['F_vortex_amp']:.0f} N**.\n\n"
             f"The figure shows each component in time (left) and "
-            f"frequency (right); dashed lines mark the two structural "
-            f"natural frequencies.",
+            f"frequency (right); dashed lines mark the natural "
+            f"frequencies f_heave and f_mast, and the vortex-shedding "
+            f"frequency f_s.",
             style=body_text),
         dcc.Graph(figure=_aero_fig_forcing(d),
                   config={'displayModeBar': False}),
@@ -7128,6 +7147,30 @@ def _tab_aero_body(d):
             style=body_text),
         dcc.Graph(figure=_aero_fig_responses(d),
                   config={'displayModeBar': False}),
+        expandable_note(
+            'What is vortex-induced vibration (VIV)?', html.Div([
+                dcc.Markdown('VIV stands for vortex-induced vibration.',
+                             style=note_text),
+                dcc.Markdown(
+                    'Vortex shedding always produces a small oscillating '
+                    'cross-wind force on the mast, at the shedding '
+                    'frequency f_s.', style=note_text),
+                dcc.Markdown(
+                    "VIV happens when the shedding frequency f_s lands on "
+                    "the mast's natural frequency f_mast. The small force "
+                    "is now applied at exactly the rhythm the structure "
+                    "responds to most strongly, so the motion builds up "
+                    "cycle after cycle into a large vibration. This is "
+                    "resonance, driven by vortex shedding.",
+                    style=note_text),
+                dcc.Markdown(
+                    'VIV matters because that large, repeated vibration '
+                    'causes fatigue. It is a known problem for slender '
+                    'structures — chimneys, antennas, bridge cables, '
+                    'subsea risers and mooring lines. Engineers design to '
+                    'keep f_s away from any natural frequency, or add '
+                    'damping.', style=note_text),
+            ])),
         dcc.Markdown(
             mast_line + "\n"
             f"- **Heave** is slow — natural frequency "
@@ -7244,10 +7287,7 @@ def tab_aero():
             "- These drive two structural modes — the slow **heave** "
             "mode and the fast **mast bending** mode. Each mode amplifies "
             "the forcing near its own natural frequency: **slow gusts "
-            "drive heave**, **vortex shedding drives mast bending**.\n"
-            "- Use the sliders to move the vortex-shedding frequency and "
-            "the mode frequencies onto or off each other, and watch the "
-            "response change."
+            "drive heave**, **vortex shedding drives mast bending**."
         ),
         _aero_schematic(),
         sliders_panel,
@@ -7257,6 +7297,211 @@ def tab_aero():
                               children=_tab_aero_body(d_init)),
         ),
     ])
+def tab_modelling():
+    """Tab 7: Modelling Methods — the three wave regimes, the panel method
+    versus CFD, and the structural-side counterpart (FEM versus modal
+    decomposition). A conceptual reference tab; static, no sliders."""
+    section_h = {'fontSize': '15px', 'fontWeight': '600',
+                 'color': COLORS['text'], 'margin': '16px 0 6px 0'}
+    body_text = {'fontSize': '13.5px', 'lineHeight': '1.65',
+                 'margin': '6px 0 14px 0'}
+    note_text = {'fontSize': '12.5px', 'lineHeight': '1.6',
+                 'margin': '0 0 10px 0'}
+    img_style = {'display': 'block', 'width': '100%',
+                 'margin': '10px auto 14px auto'}
+
+    return html.Div([
+        tab_header(
+            'Modelling Methods — predicting the float–wave interaction',
+            'The method used to predict how the float responds to waves '
+            'depends on the sea state. Small waves can be handled with a '
+            'fast, linear method; steeper or breaking waves need more '
+            'expensive ones.'),
+
+        # ===== SECTION 1 — WAVE REGIMES =====
+        html.Div('1 — Three wave regimes', style=section_h),
+        html.Img(src='/assets/linearnonlinearbreakingwave.png',
+                 alt='Linear, mild nonlinear and breaking wave regimes',
+                 style={**img_style, 'maxWidth': '660px'}),
+        dcc.Markdown(
+            "Ocean waves fall into three regimes, set by their steepness — "
+            "wave height H over wavelength L:\n\n"
+            "- **Linear** (H/L < 1/30) — small, near-sinusoidal waves. Any "
+            "irregular sea is a sum of sine waves, and the float's response "
+            "to each is computed once and added up. This is the frequency "
+            "domain.\n"
+            "- **Mild nonlinear / Stokes** (1/30 < H/L < 1/7) — steeper "
+            "waves, with sharper crests and flatter troughs. The response "
+            "to two waves is no longer the sum of the responses, so "
+            "superposition fails and the problem must be solved step by "
+            "step in the time domain.\n"
+            "- **Breaking** (H/L > 1/7) — the crest overturns; the free "
+            "surface becomes multi-valued, with white-water, spray and air "
+            "entrainment. The physics is discontinuous, and only full CFD "
+            "can capture it.",
+            style=body_text),
+
+        # ===== SECTION 2 — TWO METHODS =====
+        html.Div('2 — Two computational methods', style=section_h),
+        html.Img(src='/assets/panel_CFD.png',
+                 alt='Panel method surface mesh versus CFD volume mesh',
+                 style={**img_style, 'maxWidth': '620px'}),
+        dcc.Markdown(
+            "The **panel method** meshes only the wetted surface of the "
+            "float — the two-dimensional skin in contact with the water — "
+            "and solves the linear potential-flow problem. It returns the "
+            "float's frequency-domain hydrodynamic coefficients: added "
+            "mass, radiation damping, and wave-excitation force, each as a "
+            "function of wave frequency. Because it meshes a surface, not a "
+            "volume, and the problem is linear, it is cheap — one solve per "
+            "frequency. It assumes potential flow: inviscid, small wave "
+            "amplitude.",
+            style=body_text),
+        dcc.Markdown(
+            "**CFD** meshes the entire three-dimensional water volume "
+            "around the float and solves the full Navier–Stokes equations, "
+            "marching forward in time and tracking the free surface. It "
+            "captures what the panel method leaves out: viscosity, flow "
+            "separation, vortex shedding, wave breaking, large-amplitude "
+            "motion, and the splash zone. The cost is much higher.",
+            style=body_text),
+
+        # ===== "+" NOTE — WHY ONLY THE SURFACE =====
+        expandable_note(
+            'Why the panel method only needs the surface', html.Div([
+                dcc.Markdown(
+                    "The panel method meshes only the float's wetted "
+                    "surface, not the water around it. Two things make "
+                    "that possible, and they do two separate jobs.",
+                    style=note_text),
+                dcc.Markdown(
+                    "**Potential flow makes the equation simple.** If the "
+                    "flow is assumed inviscid and irrotational, the whole "
+                    "flow can be described by one scalar potential φ, and φ "
+                    "obeys a single equation — Laplace's equation, "
+                    "∇²φ = 0. That is much simpler than the full "
+                    "Navier–Stokes equations.",
+                    style=note_text),
+                dcc.Markdown(
+                    "**Gauss's theorem moves the problem onto the "
+                    "surface.** Laplace's equation has a special property: "
+                    "the solution inside a region is fixed entirely by the "
+                    "values on its boundary.",
+                    style=note_text),
+                dcc.Markdown(
+                    "So potential flow makes the equation simple enough, "
+                    "and Gauss's theorem is what then moves it onto the "
+                    "surface. The method is also called the Boundary "
+                    "Element Method.",
+                    style=note_text),
+                dcc.Markdown(
+                    "Common panel-method software includes WAMIT, ANSYS "
+                    "AQWA and OrcaWave (commercial), and NEMOH and "
+                    "Capytaine (open-source).",
+                    style=note_text),
+            ])),
+
+        # ===== SECTION 3 — REGIME PICKS METHOD =====
+        html.Div('3 — How the regime picks the method', style=section_h),
+        dcc.Markdown(
+            "The wave regime sets which method, and which solution domain, "
+            "you need:\n\n"
+            "- **Linear → frequency-domain panel method.** The cheapest "
+            "option — used for energy-production estimates and large "
+            "parameter sweeps.\n"
+            "- **Mild nonlinear → time domain.** A time-domain panel "
+            "method still works — the surface mesh and potential-flow "
+            "assumption survive, but the solution is marched in time "
+            "rather than solved per frequency.\n"
+            "- **Breaking, slamming, viscous-dominated loads → CFD only.** "
+            "Potential flow cannot represent an overturning surface or air "
+            "entrainment, so even a time-domain panel method fails here.",
+            style=body_text),
+        _aero_table(
+            ['', 'Panel method', 'CFD'],
+            [['Mesh', 'wetted surface (2D)', 'water volume (3D)'],
+             ['Equations', 'potential flow (Laplace)', 'Navier–Stokes'],
+             ['Solution domain', 'frequency (linear) or time (nonlinear)',
+              'time'],
+             ['Wave regime', 'linear to mild nonlinear', 'up to breaking'],
+             ['Viscosity / breaking', 'not captured', 'captured'],
+             ['Output', 'hydrodynamic coefficients vs frequency',
+              'full flow field, loads, free surface'],
+             ['Cost', 'low — one solve per frequency',
+              'high — time-stepped 3D solve']]),
+
+        # ===== SECTION 4 — CONNECTION TO THE DASHBOARD =====
+        html.Div('4 — How this connects to the rest of the dashboard',
+                 style=section_h),
+        dcc.Markdown(
+            "The panel method and the single-degree-of-freedom (SDOF) "
+            "models in the Resonance and Aero tabs belong to the same "
+            "chain of models. The panel method computes the fluid forces; "
+            "the SDOF equation of motion uses them:",
+            style=body_text),
+        latex_equation(r'm\,\ddot{x} + c\,\dot{x} + k\,x = F(t)'),
+        dcc.Markdown(
+            "- **m** = structural mass + added mass "
+            "*(added mass from the panel method)*\n"
+            "- **c** = radiation damping *(from the panel method)* + PTO "
+            "damping + viscous damping\n"
+            "- **F(t)** = wave-excitation force *(from the panel method)*, "
+            "driven by the wave spectrum\n"
+            "- **k** = hydrostatic stiffness, ρ g A (A = waterplane area)",
+            style=body_text),
+        dcc.Markdown(
+            "The SDOF model is itself a simplification, in two ways: it "
+            "reduces the float's six rigid-body degrees of freedom to one, "
+            "and it uses constant m, c, k where the true added mass and "
+            "radiation damping are frequency-dependent, A(ω) and B(ω).",
+            style=body_text),
+        dcc.Markdown(
+            "From most detailed to least: CFD (full fluid physics) → panel "
+            "method (potential-flow simplification of the fluid) → "
+            "multi-degree-of-freedom frequency-domain model → SDOF (one "
+            "degree of freedom, constant coefficients).",
+            style=body_text),
+
+        # ===== SECTION 5 — STRUCTURAL SIDE =====
+        html.Div('5 — The same choice on the structural side',
+                 style=section_h),
+        dcc.Markdown(
+            "The split between a high-fidelity method and a reduced-order "
+            "one is not specific to hydrodynamics. The structural problem "
+            "— the stress and deformation of the steel — has the same "
+            "split.",
+            style=body_text),
+        dcc.Markdown(
+            "The **finite element method (FEM)** divides the structure "
+            "into a large number of small elements, solves the equations "
+            "of elasticity on each, and assembles them into one large "
+            "matrix system. Like CFD, it is a domain method — it "
+            "discretizes the whole structure, not just a surface. It is "
+            "high-fidelity but expensive, and not practical for "
+            "fleet-scale work. Common FEM packages include ANSYS and "
+            "NASTRAN.",
+            style=body_text),
+        dcc.Markdown(
+            "**Modal decomposition** is the reduced-order alternative. A "
+            "structure responds to wave loading mostly through a small "
+            "number of dominant modes — rigid-body heave, surge and "
+            "pitch, and one or two mast bending modes. The response is "
+            "projected onto a handful of modal coordinates instead of "
+            "millions of degrees of freedom. The SDOF models in the "
+            "Resonance and Aero tabs are the simplest version of this — a "
+            "single mode; a fleet-scale model would keep the same form "
+            "with more modes.",
+            style=body_text),
+        dcc.Markdown(
+            "So both halves of the WEC model — fluid and structure — "
+            "follow the same split: a high-fidelity method (CFD, FEM) for "
+            "detailed or extreme cases, and a reduced-order method (the "
+            "panel method with SDOF, modal decomposition) for work that "
+            "has to run across the fleet.",
+            style=body_text),
+    ])
+
+
 # ========================================================================
 # APP LAYOUT
 # ========================================================================
@@ -7277,6 +7522,7 @@ TABS = [
     {'label': 'Pressure',     'value': 'tab-4'},
     {'label': 'ADCP',         'value': 'tab-5'},
     {'label': 'Aero Loading', 'value': 'tab-6'},
+    {'label': 'Modelling Methods', 'value': 'tab-7'},
 ]
 
 app.layout = html.Div([
@@ -7312,6 +7558,7 @@ def render_tab(tab_value):
         'tab-4': tab_pressure,
         'tab-5': tab_adcp,
         'tab-6': tab_aero,
+        'tab-7': tab_modelling,
     }.get(tab_value, tab_overview)()
 
 
