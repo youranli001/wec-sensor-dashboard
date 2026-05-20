@@ -2449,12 +2449,137 @@ def make_adcp_data(
 
 # Load all data at startup
 print("Pre-computing sensor data...")
+def make_aero_data(U_mean=10.0, f_heave=0.125, zeta_heave=0.05,
+                   f_mast=2.0, zeta_mast=0.02):
+    """Simulate wind loading on the above-water part of the float.
+
+    Adjustable inputs (driven by the tab sliders): mean wind speed
+    U_mean, and the natural frequency / damping ratio of each mode.
+    For each mode the modal STIFFNESS is held fixed and the mass
+    follows from m = k / omega_n^2.
+
+    The wind-exposed structure has two relevant modes:
+      - Heave        : the whole float bobbing vertically, slow
+      - Mast bending : the slender instrumentation mast, fast
+
+    Wind forcing is split into two physical components. Plan A: both are
+    summed into one forcing F_wind and applied to both modes; each mode
+    then naturally filters out the part near its own natural frequency.
+      - Slow gust    : the fluctuating part of drag, because wind speed
+                       fluctuates. Broadband, low frequency.
+      - Vortex shed  : the alternating transverse force as wind flows past
+                       the cylindrical mast. Narrowband, at the Strouhal
+                       frequency.
+
+    All numbers are illustrative but internally consistent — the forcing
+    amplitudes are derived from the wind / geometry parameters below.
+    """
+    # ---- Wind and geometry parameters ----
+    rho_air = 1.2                       # kg/m^3   air density
+    C_d = 1.0                           #          drag coefficient (bluff body)
+    A_float = 30.0                      # m^2      projected area, above-water float
+    C_L = 0.5                           #          transverse (lift) coefficient
+    D_mast = 1.0                        # m        mast diameter
+    L_mast = 8.0                        # m        mast length
+    A_mast = D_mast * L_mast            # m^2      projected area of the mast
+    St = 0.2                            #          Strouhal number
+    f_shed = St * U_mean / D_mast       # Hz       vortex shedding frequency
+
+    F_drag_mean = 0.5 * rho_air * C_d * A_float * U_mean ** 2   # steady drag
+    gust_scale = rho_air * C_d * A_float * U_mean               # N per (m/s) of u'
+    F_vortex_amp = 0.5 * rho_air * C_L * A_mast * U_mean ** 2    # vortex amplitude
+
+    # ---- Two structural modes: stiffness fixed, modal mass follows ----
+    # Stiffness is fixed at its reference value (50 t heave at 0.125 Hz,
+    # 2 t mast at 2.0 Hz); the frequency slider then sets the modal
+    # mass. Holding k fixed keeps the static compliance 1/k constant, so
+    # the slider isolates the resonance effect (not a stiffness change).
+    k_heave = 50_000.0 * (2 * np.pi * 0.125) ** 2   # N/m  heave stiffness (fixed)
+    omega_heave = 2 * np.pi * f_heave
+    m_heave = k_heave / omega_heave ** 2            # modal mass follows
+    T_heave = 1.0 / f_heave
+    c_heave = 2 * zeta_heave * np.sqrt(k_heave * m_heave)
+
+    k_mast = 2_000.0 * (2 * np.pi * 2.0) ** 2       # N/m  mast stiffness (fixed)
+    omega_mast = 2 * np.pi * f_mast
+    m_mast = k_mast / omega_mast ** 2               # modal mass follows
+    T_mast = 1.0 / f_mast
+    c_mast = 2 * zeta_mast * np.sqrt(k_mast * m_mast)
+
+    # ---- Time array ----
+    dt = 0.02
+    T_total = 200.0
+    t = np.arange(0, T_total, dt)
+    N = len(t)
+    rng = np.random.default_rng(42)
+
+    # ---- Slow gust: F_gust = gust_scale * u'(t), u' = low-pass noise ----
+    white = rng.standard_normal(N)
+    win = int(15.0 / dt)
+    kernel = np.ones(win) / win
+    u_prime = np.convolve(white, kernel, mode='same')
+    u_prime = 2.0 * u_prime / u_prime.std()         # RMS 2 m/s wind fluctuation
+    F_gust = gust_scale * u_prime
+
+    # ---- Fast vortex shedding: narrowband near f_shed ----
+    phase_drift = np.cumsum(0.015 * rng.standard_normal(N))
+    F_vortex = F_vortex_amp * np.sin(2 * np.pi * f_shed * t + phase_drift)
+
+    F_wind = F_gust + F_vortex
+
+    # ---- SDOF solver (semi-implicit / symplectic Euler) ----
+    def _solve(mass, damp, stiff, force):
+        x = np.zeros(N)
+        v = np.zeros(N)
+        for i in range(1, N):
+            a = (force[i - 1] - damp * v[i - 1] - stiff * x[i - 1]) / mass
+            v[i] = v[i - 1] + a * dt
+            x[i] = x[i - 1] + v[i] * dt
+        return x
+
+    x_heave = _solve(m_heave, c_heave, k_heave, F_wind)
+    x_mast = _solve(m_mast, c_mast, k_mast, F_wind)
+
+    # ---- Amplitude spectra ----
+    freqs = np.fft.rfftfreq(N, dt)
+
+    def _spec(sig):
+        return np.abs(np.fft.rfft(sig)) / N * 2
+
+    return {
+        't': t, 'freqs': freqs, 'dt': dt,
+        'F_gust': F_gust, 'F_vortex': F_vortex, 'F_wind': F_wind,
+        'x_heave': x_heave, 'x_mast': x_mast,
+        'spec_gust': _spec(F_gust), 'spec_vortex': _spec(F_vortex),
+        'spec_wind': _spec(F_wind),
+        'spec_heave': _spec(x_heave), 'spec_mast': _spec(x_mast),
+        'f_heave': f_heave, 'f_mast': f_mast,
+        'T_heave': T_heave, 'T_mast': T_mast, 'f_shed': f_shed,
+        'heave_rms_mm': float(np.std(x_heave) * 1000.0),
+        'mast_rms_mm': float(np.std(x_mast) * 1000.0),
+        'wind': {
+            'rho_air': rho_air, 'U_mean': U_mean, 'C_d': C_d,
+            'A_float': A_float, 'C_L': C_L, 'D_mast': D_mast,
+            'L_mast': L_mast, 'A_mast': A_mast, 'St': St, 'f_shed': f_shed,
+            'F_drag_mean': F_drag_mean, 'gust_scale': gust_scale,
+            'F_vortex_amp': F_vortex_amp,
+        },
+        'params': {
+            'm_heave': m_heave, 'k_heave': k_heave, 'c_heave': c_heave,
+            'zeta_heave': zeta_heave, 'omega_heave': omega_heave,
+            'm_mast': m_mast, 'k_mast': k_mast, 'c_mast': c_mast,
+            'zeta_mast': zeta_mast, 'omega_mast': omega_mast,
+        },
+    }
+
+
 DATA = {
     'fatigue': make_fatigue_data(),
     'strain': make_strain_data(),
     'motion': make_motion_data(),
     'pressure': make_pressure_data(),
     'adcp': make_adcp_data(),
+    'aero': make_aero_data(),
 }
 print("Data loaded.")
 
@@ -6618,6 +6743,521 @@ the name.
 
 
 # ========================================================================
+# AERO LOADING TAB
+# ========================================================================
+def _aero_table(header, rows):
+    """Small table. header: list of column titles. rows: list of row lists."""
+    thead = html.Tr([
+        html.Th(h, style={**STYLES['param_label'], 'fontWeight': '700',
+                          'color': COLORS['text'], 'textAlign': 'left',
+                          'borderBottom': f"1px solid {COLORS['border']}",
+                          'paddingBottom': '5px'})
+        for h in header])
+    body = []
+    for r in rows:
+        body.append(html.Tr([
+            html.Td(c, style=(STYLES['param_label'] if j == 0
+                              else STYLES['param_value']))
+            for j, c in enumerate(r)]))
+    return html.Table([thead] + body,
+                      style={**STYLES['param_table'], 'margin': '12px 0 6px 0'})
+
+
+def _aero_fig_forcing(d):
+    """3 rows (gust / vortex / total) x 2 cols (time / frequency)."""
+    t = d['t']
+    freqs = d['freqs']
+    tmask = t <= 50.0
+    fmask = (freqs > 0.01) & (freqs < 5.0)
+    fig = make_subplots(
+        rows=3, cols=2, vertical_spacing=0.11, horizontal_spacing=0.10,
+        subplot_titles=(
+            'Slow gust  —  time', 'Slow gust  —  frequency',
+            'Vortex shedding  —  time', 'Vortex shedding  —  frequency',
+            'Total wind forcing  —  time', 'Total wind forcing  —  frequency'),
+    )
+    series = [
+        ('F_gust', 'spec_gust', COLORS['plot_2']),
+        ('F_vortex', 'spec_vortex', COLORS['warning']),
+        ('F_wind', 'spec_wind', COLORS['plot_1']),
+    ]
+    for i, (tkey, fkey, color) in enumerate(series):
+        row = i + 1
+        fig.add_trace(go.Scatter(
+            x=t[tmask], y=d[tkey][tmask], mode='lines',
+            line=dict(color=color, width=1)), row=row, col=1)
+        fig.add_trace(go.Scatter(
+            x=freqs[fmask], y=d[fkey][fmask], mode='lines',
+            line=dict(color=color, width=1.3)), row=row, col=2)
+        fig.add_vline(x=d['f_heave'], line=dict(color=COLORS['accent'],
+                      width=1, dash='dash'), row=row, col=2)
+        fig.add_vline(x=d['f_mast'], line=dict(color=COLORS['alert'],
+                      width=1, dash='dash'), row=row, col=2)
+        fig.update_xaxes(type='log', row=row, col=2)
+    fig.update_xaxes(title_text='Time (s)', row=3, col=1)
+    fig.update_xaxes(title_text='Frequency (Hz)', row=3, col=2)
+    fig.update_yaxes(title_text='Force (N)', row=2, col=1)
+    fig.update_yaxes(title_text='Amplitude (N)', row=2, col=2)
+    fig.update_layout(plot_layout(height=640, showlegend=False, hovermode='x'))
+    return fig
+
+
+def _aero_fig_responses(d):
+    """2 rows (heave / mast bending) x 2 cols (time / frequency)."""
+    t = d['t']
+    freqs = d['freqs']
+    tmask = t <= 50.0
+    fmask = (freqs > 0.01) & (freqs < 5.0)
+    fig = make_subplots(
+        rows=2, cols=2, vertical_spacing=0.15, horizontal_spacing=0.10,
+        subplot_titles=(
+            'Heave response  (slow mode)  —  time',
+            'Heave response  —  frequency',
+            'Mast bending response  (fast mode)  —  time',
+            'Mast bending response  —  frequency'),
+    )
+    rows_spec = [
+        ('x_heave', 'spec_heave', COLORS['accent']),
+        ('x_mast', 'spec_mast', COLORS['alert']),
+    ]
+    for i, (tkey, fkey, color) in enumerate(rows_spec):
+        row = i + 1
+        fig.add_trace(go.Scatter(
+            x=t[tmask], y=d[tkey][tmask] * 1000.0, mode='lines',
+            line=dict(color=color, width=1)), row=row, col=1)
+        fig.add_trace(go.Scatter(
+            x=freqs[fmask], y=d[fkey][fmask] * 1000.0, mode='lines',
+            line=dict(color=color, width=1.3)), row=row, col=2)
+        fig.add_vline(x=d['f_heave'], line=dict(color=COLORS['accent'],
+                      width=1, dash='dash'), row=row, col=2)
+        fig.add_vline(x=d['f_mast'], line=dict(color=COLORS['alert'],
+                      width=1, dash='dash'), row=row, col=2)
+        fig.update_xaxes(type='log', row=row, col=2)
+        fig.update_yaxes(title_text='Displacement (mm)', row=row, col=1)
+        fig.update_yaxes(title_text='Amplitude (mm)', row=row, col=2)
+    fig.update_xaxes(title_text='Time (s)', row=2, col=1)
+    fig.update_xaxes(title_text='Frequency (Hz)', row=2, col=2)
+    fig.update_layout(plot_layout(height=480, showlegend=False, hovermode='x'))
+    return fig
+
+
+def _aero_fig_bridge(d):
+    """Flow diagram: wind forcing (input) -> equation of motion -> response
+    (output), for both modes. Shows that the forcing in Section 1 is the
+    input that the Section 2 response is solved from."""
+    fig = go.Figure()
+
+    # boxes: x0, y0, x1, y1, fill, border
+    boxes = [
+        (40, 135, 216, 235, '#EEF2F7', '#C0C7D0'),     # wind forcing
+        (292, 215, 488, 305, '#E7F0F9', '#2563EB'),    # heave mode
+        (292, 58, 488, 148, '#F8E9E7', '#B91C1C'),     # mast mode
+        (560, 215, 732, 305, '#E7F0F9', '#9DBBD2'),    # heave response
+        (560, 58, 732, 148, '#F8E9E7', '#D9A7A2'),     # mast response
+    ]
+    for x0, y0, x1, y1, fill, border in boxes:
+        fig.add_shape(type='rect', x0=x0, y0=y0, x1=x1, y1=y1,
+                      fillcolor=fill, line=dict(color=border, width=1.4),
+                      layer='below')
+
+    def txt(x, y, s, size=12, color='#1F2937', mono=False, bold=False):
+        fam = "'SF Mono', Menlo, monospace" if mono else FONT
+        label = f"<b>{s}</b>" if bold else s
+        fig.add_annotation(x=x, y=y, text=label, showarrow=False,
+                           font=dict(size=size, color=color, family=fam))
+
+    # column headers
+    txt(128, 342, 'INPUT', 13, '#1F2937', bold=True)
+    txt(390, 342, 'THE STRUCTURE', 13, '#1F2937', bold=True)
+    txt(646, 342, 'RESPONSE', 13, '#1F2937', bold=True)
+    # wind forcing box
+    txt(128, 212, 'Wind forcing', 12.5, '#1F2937', bold=True)
+    txt(128, 189, 'F(t)', 18, '#1F2937', bold=True)
+    txt(128, 161, 'Section 1 — gust + vortex', 10.5, '#6B7280')
+    # heave mode box
+    txt(390, 289, 'Heave mode', 12, '#2563EB', bold=True)
+    txt(390, 263, "m x'' + c x' + k x = F(t)", 12, '#1F2937', mono=True)
+    txt(390, 237, "solved with heave's m, k, c", 10.5, '#6B7280')
+    # mast mode box
+    txt(390, 132, 'Mast bending mode', 12, '#B91C1C', bold=True)
+    txt(390, 106, "m x'' + c x' + k x = F(t)", 12, '#1F2937', mono=True)
+    txt(390, 80, "solved with mast's m, k, c", 10.5, '#6B7280')
+    # heave response box
+    txt(646, 289, 'Heave response', 12, '#2563EB', bold=True)
+    txt(646, 264, 'x(t)', 17, '#1F2937', bold=True)
+    txt(646, 238, f"slow — peaks at {d['f_heave']:.3f} Hz", 10.5, '#6B7280')
+    # mast response box
+    txt(646, 132, 'Mast response', 12, '#B91C1C', bold=True)
+    txt(646, 107, 'x(t)', 17, '#1F2937', bold=True)
+    txt(646, 81, f"fast — peaks at {d['f_mast']:.2f} Hz", 10.5, '#6B7280')
+
+    def arrow(x0, y0, x1, y1):
+        fig.add_annotation(x=x1, y=y1, ax=x0, ay=y0, xref='x', yref='y',
+                           axref='x', ayref='y', showarrow=True, text='',
+                           arrowhead=2, arrowsize=1.1, arrowwidth=1.6,
+                           arrowcolor='#6B7280')
+    arrow(216, 185, 290, 256)      # forcing -> heave mode
+    arrow(216, 185, 290, 108)      # forcing -> mast mode
+    arrow(488, 260, 558, 260)      # heave mode -> heave response
+    arrow(488, 103, 558, 103)      # mast mode -> mast response
+    txt(250, 201, 'same F(t)', 10, '#4A4A48')
+
+    fig.update_layout(plot_layout(height=400, showlegend=False,
+                                  hovermode=False,
+                                  margin=dict(l=10, r=10, t=10, b=10)))
+    fig.update_xaxes(visible=False, range=[15, 745])
+    fig.update_yaxes(visible=False, range=[45, 360],
+                     scaleanchor='x', scaleratio=1)
+    return fig
+
+
+_AERO_SCHEMATIC_B64 = (
+    "PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA3NDAgNTYwIiByb2xlPSJpbWciPgogIDx0aXRsZT5BZXJvIGxvYWRpbmcgc2NoZW1hdGljOiBndXN0IGRyYWcsIHZvcnRleCBzaGVkZGluZywgc3BsYXNoIHpvbmU8L3RpdGxlPgogIDxzdHlsZT4KICAgIC5saCB7IGZvbnQ6IDYwMCAxM3B4IHN5c3RlbS11aSwgc2Fucy1zZXJpZjsgfQogICAgLmxzIHsgZm9udDogNDAwIDExcHggc3lzdGVtLXVpLCBzYW5zLXNlcmlmOyBmaWxsOiAjNUE1QTU1OyB9CiAgICAubHcgeyBmb250OiA0MDAgMTEuNXB4IHN5c3RlbS11aSwgc2Fucy1zZXJpZjsgZmlsbDogI0VBRjFGNjsgfQogICAgLmxlYWRlciB7IHN0cm9rZTogI0EwQTA5QTsgc3Ryb2tlLXdpZHRoOiAxOyBzdHJva2UtZGFzaGFycmF5OiAzIDI7IGZpbGw6IG5vbmU7IH0KICA8L3N0eWxlPgogIDxkZWZzPgogICAgPG1hcmtlciBpZD0iYXIiIHZpZXdCb3g9IjAgMCAxMCAxMCIgcmVmWD0iOCIgcmVmWT0iNSIgbWFya2VyV2lkdGg9IjYiIG1hcmtlckhlaWdodD0iNiIgb3JpZW50PSJhdXRvLXN0YXJ0LXJldmVyc2UiPgogICAgICA8cGF0aCBkPSJNMiAxTDggNUwyIDkiIGZpbGw9Im5vbmUiIHN0cm9rZT0iY29udGV4dC1zdHJva2UiIHN0cm9rZS13aWR0aD0iMS42IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz4KICAgIDwvbWFya2VyPgogICAgPGxpbmVhckdyYWRpZW50IGlkPSJ3ZyIgeDE9IjAiIHkxPSIwIiB4Mj0iMCIgeTI9IjEiPgogICAgICA8c3RvcCBvZmZzZXQ9IjAlIiBzdG9wLWNvbG9yPSIjNkZBMEMwIi8+CiAgICAgIDxzdG9wIG9mZnNldD0iMTAwJSIgc3RvcC1jb2xvcj0iIzIzNDQ2OCIvPgogICAgPC9saW5lYXJHcmFkaWVudD4KICA8L2RlZnM+CiAgPHJlY3QgeD0iMCIgeT0iMCIgd2lkdGg9Ijc0MCIgaGVpZ2h0PSIzMDAiIGZpbGw9IiNEQUU4RjIiLz4KICA8cmVjdCB4PSIwIiB5PSIzMDAiIHdpZHRoPSI3NDAiIGhlaWdodD0iMjYwIiBmaWxsPSJ1cmwoI3dnKSIvPgogIDxsaW5lIHgxPSIyNzAiIHkxPSIxNDgiIHgyPSIyNzAiIHkyPSIxMzUiIHN0cm9rZT0iIzNEM0QzQSIgc3Ryb2tlLXdpZHRoPSIyIi8+CiAgPGNpcmNsZSBjeD0iMjcwIiBjeT0iMTMyIiByPSIzLjUiIGZpbGw9IiMzRDNEM0EiLz4KICA8cmVjdCB4PSIyNjUiIHk9IjE0OCIgd2lkdGg9IjEwIiBoZWlnaHQ9IjY4IiBmaWxsPSIjOEE4QTg1IiBzdHJva2U9IiMzRDNEM0EiIHN0cm9rZS13aWR0aD0iMSIvPgogIDxyZWN0IHg9IjI0NCIgeT0iMjE2IiB3aWR0aD0iNTIiIGhlaWdodD0iMjQiIGZpbGw9IiM2RTZFNjkiIHN0cm9rZT0iIzNEM0QzQSIgc3Ryb2tlLXdpZHRoPSIxIi8+CiAgPHJlY3QgeD0iMjA4IiB5PSIyNDAiIHdpZHRoPSIxMjQiIGhlaWdodD0iMTQyIiByeD0iNSIgZmlsbD0iIzdDN0M3NyIgc3Ryb2tlPSIjM0QzRDNBIiBzdHJva2Utd2lkdGg9IjEiLz4KICA8cmVjdCB4PSIyNTYiIHk9IjM4MiIgd2lkdGg9IjI4IiBoZWlnaHQ9IjcyIiBmaWxsPSIjNkU2RTY5IiBzdHJva2U9IiMzRDNEM0EiIHN0cm9rZS13aWR0aD0iMSIvPgogIDxyZWN0IHg9IjIxMCIgeT0iNDU0IiB3aWR0aD0iMTIwIiBoZWlnaHQ9IjQ2IiByeD0iNiIgZmlsbD0iIzZFNkU2OSIgc3Ryb2tlPSIjM0QzRDNBIiBzdHJva2Utd2lkdGg9IjEiLz4KICA8cGF0aCBkPSJNMCwzMDAgUTYwLDI5MiAxMjAsMzAwIFQyNDAsMzAwIFQzNjAsMzAwIFQ0ODAsMzAwIFQ2MDAsMzAwIFQ3NDAsMzAwIiBmaWxsPSJub25lIiBzdHJva2U9IiMxQTM0NTQiIHN0cm9rZS13aWR0aD0iMS42Ii8+CiAgPHRleHQgY2xhc3M9ImxoIiB4PSIzMCIgeT0iMTEyIiBmaWxsPSIjM0QzRDNBIj5XaW5kPC90ZXh0PgogIDxsaW5lIHgxPSIyOCIgeTE9IjE2NiIgeDI9IjIwMyIgeTI9IjE2NiIgc3Ryb2tlPSIjM0QzRDNBIiBzdHJva2Utd2lkdGg9IjEuNSIgbWFya2VyLWVuZD0idXJsKCNhcikiLz4KICA8bGluZSB4MT0iMjgiIHkxPSIyMDYiIHgyPSIyMDMiIHkyPSIyMDYiIHN0cm9rZT0iIzNEM0QzQSIgc3Ryb2tlLXdpZHRoPSIxLjUiIG1hcmtlci1lbmQ9InVybCgjYXIpIi8+CiAgPGxpbmUgeDE9IjI4IiB5MT0iMjQ2IiB4Mj0iMjAzIiB5Mj0iMjQ2IiBzdHJva2U9IiMzRDNEM0EiIHN0cm9rZS13aWR0aD0iMS41IiBtYXJrZXItZW5kPSJ1cmwoI2FyKSIvPgogIDxwYXRoIGQ9Ik0zMDAsMTU2IEExMCwxMCAwIDEgMCAyOTkuNiwxNzYgQTYuMyw2LjMgMCAxIDAgMzAwLjQsMTYyLjUgQTMsMyAwIDEgMCAzMDAsMTY4IiBmaWxsPSJub25lIiBzdHJva2U9IiMyQjZGQTgiIHN0cm9rZS13aWR0aD0iMS43Ii8+CiAgPHBhdGggZD0iTTMzMiwxODggQTEwLDEwIDAgMSAxIDMzMi40LDIwOCBBNi4zLDYuMyAwIDEgMSAzMzEuNiwxOTQuNSBBMywzIDAgMSAxIDMzMiwyMDAiIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzJCNkZBOCIgc3Ryb2tlLXdpZHRoPSIxLjciLz4KICA8cGF0aCBkPSJNMzY0LDE1NiBBMTAsMTAgMCAxIDAgMzYzLjYsMTc2IEE2LjMsNi4zIDAgMSAwIDM2NC40LDE2Mi41IEEzLDMgMCAxIDAgMzY0LDE2OCIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjMkI2RkE4IiBzdHJva2Utd2lkdGg9IjEuNyIvPgogIDxsaW5lIHgxPSIzMzIiIHkxPSIyNzYiIHgyPSI0MjQiIHkyPSIyNzYiIHN0cm9rZT0iI0MwMzkyQiIgc3Ryb2tlLXdpZHRoPSI0IiBtYXJrZXItZW5kPSJ1cmwoI2FyKSIvPgogIDxwYXRoIGQ9Ik02MCwzMDQgUTExMCwzMDAgMTQyLDI5NSBRMTY2LDI5MSAxODIsMzAwIFExNDYsMzA3IDEwNCwzMDkgUTgwLDMxMCA2MCwzMDYgWiIgZmlsbD0iIzVDOEZCNSIgb3BhY2l0eT0iMC43Ii8+CiAgPHBhdGggZD0iTTIwOCwzMDMgQzE4NiwzMDQgMTYyLDMwMCAxNjYsMjgzIEMxNjksMjcyIDE4OCwyNzUgMTk2LDI4NiBDMjAzLDI5NCAyMDcsMjgyIDIwNSwyNzAgQzIwNCwyNjAgMjA4LDI1MSAyMDgsMjUxIEMyMDYsMjY4IDIxMywyODkgMjA4LDMwMyBaIiBmaWxsPSIjQkJEQ0VDIiBvcGFjaXR5PSIwLjkyIiBzdHJva2U9IiM4RkJERDgiIHN0cm9rZS13aWR0aD0iMSIvPgogIDxwYXRoIGQ9Ik0yMDgsMzAwIEMxOTAsMzAwIDE3MCwyOTYgMTc0LDI4NiBDMTc4LDI3OSAxOTAsMjgxIDE5NiwyODkgQzIwMCwyOTUgMjA1LDI4NiAyMDQsMjc3IEMyMDMsMjcwIDIwOCwyNjYgMjA4LDI2NiBaIiBmaWxsPSIjRkZGRkZGIiBvcGFjaXR5PSIwLjc4Ii8+CiAgPGNpcmNsZSBjeD0iMTc2IiBjeT0iMjQ4IiByPSI0LjUiIGZpbGw9IiNDRkU2RjIiLz4KICA8Y2lyY2xlIGN4PSIxOTAiIGN5PSIyMzQiIHI9IjMuNSIgZmlsbD0iI0NGRTZGMiIvPgogIDxjaXJjbGUgY3g9IjE2MiIgY3k9IjI2MCIgcj0iMy4yIiBmaWxsPSIjQ0ZFNkYyIi8+CiAgPGNpcmNsZSBjeD0iMjAyIiBjeT0iMjQwIiByPSIzIiBmaWxsPSIjQ0ZFNkYyIi8+CiAgPGNpcmNsZSBjeD0iMTgwIiBjeT0iMjYyIiByPSIyLjYiIGZpbGw9IiNDRkU2RjIiLz4KICA8dGV4dCBjbGFzcz0ibGgiIHg9IjI3MCIgeT0iMTA0IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmaWxsPSIjM0QzRDNBIj5JbnN0cnVtZW50YXRpb24gbWFzdDwvdGV4dD4KICA8bGluZSBjbGFzcz0ibGVhZGVyIiB4MT0iMjcwIiB5MT0iMTE0IiB4Mj0iMjcwIiB5Mj0iMTMwIi8+CiAgPHBhdGggY2xhc3M9ImxlYWRlciIgZD0iTTI3NiwxNzggTDQ1MiwxNjgiLz4KICA8Y2lyY2xlIGN4PSIyNzYiIGN5PSIxNzgiIHI9IjMiIGZpbGw9IiMyQjZGQTgiLz4KICA8dGV4dCBjbGFzcz0ibGgiIHg9IjQ2MiIgeT0iMTM4IiBmaWxsPSIjMkI2RkE4Ij5Wb3J0ZXggc2hlZGRpbmc8L3RleHQ+CiAgPGNpcmNsZSBjeD0iNDcyIiBjeT0iMTYyIiByPSIxMCIgZmlsbD0iI0ZGRkZGRiIgc3Ryb2tlPSIjMkI2RkE4IiBzdHJva2Utd2lkdGg9IjIiLz4KICA8Y2lyY2xlIGN4PSI0NzIiIGN5PSIxNjIiIHI9IjMiIGZpbGw9IiMyQjZGQTgiLz4KICA8dGV4dCBjbGFzcz0ibHMiIHg9IjQ4OSIgeT0iMTY2Ij5mb3JjZSBvdXQgb2YgdGhlIHBhZ2U8L3RleHQ+CiAgPGNpcmNsZSBjeD0iNDcyIiBjeT0iMTkwIiByPSIxMCIgZmlsbD0iI0ZGRkZGRiIgc3Ryb2tlPSIjMkI2RkE4IiBzdHJva2Utd2lkdGg9IjIiLz4KICA8bGluZSB4MT0iNDY1IiB5MT0iMTgzIiB4Mj0iNDc5IiB5Mj0iMTk3IiBzdHJva2U9IiMyQjZGQTgiIHN0cm9rZS13aWR0aD0iMiIvPgogIDxsaW5lIHgxPSI0NjUiIHkxPSIxOTciIHgyPSI0NzkiIHkyPSIxODMiIHN0cm9rZT0iIzJCNkZBOCIgc3Ryb2tlLXdpZHRoPSIyIi8+CiAgPHRleHQgY2xhc3M9ImxzIiB4PSI0ODkiIHk9IjE5NCI+Zm9yY2UgaW50byB0aGUgcGFnZTwvdGV4dD4KICA8cGF0aCBjbGFzcz0ibGVhZGVyIiBkPSJNNDI0LDI3NiBMNDUyLDI3NiIvPgogIDxjaXJjbGUgY3g9IjQyNCIgY3k9IjI3NiIgcj0iMyIgZmlsbD0iI0MwMzkyQiIvPgogIDx0ZXh0IGNsYXNzPSJsaCIgeD0iNDYyIiB5PSIyNzAiIGZpbGw9IiNDMDM5MkIiPkd1c3QgZHJhZzwvdGV4dD4KICA8dGV4dCBjbGFzcz0ibHMiIHg9IjQ2MiIgeT0iMjg4Ij5BbG9uZy13aW5kIGZvcmNlPC90ZXh0PgogIDxwYXRoIGNsYXNzPSJsZWFkZXIiIGQ9Ik0xODYsMjY4IEw0NTIsMzM4Ii8+CiAgPGNpcmNsZSBjeD0iMTg2IiBjeT0iMjY4IiByPSIzIiBmaWxsPSIjQzk3QTJCIi8+CiAgPHRleHQgY2xhc3M9ImxoIiB4PSI0NjIiIHk9IjMzOCIgZmlsbD0iI0ZGRkZGRiI+U3BsYXNoIHpvbmU8L3RleHQ+CiAgPHBhdGggY2xhc3M9ImxlYWRlciIgZD0iTTIxMiwyNzAgTDE1MCwyNjIiLz4KICA8Y2lyY2xlIGN4PSIyMTIiIGN5PSIyNzAiIHI9IjMiIGZpbGw9IiMzRDNEM0EiLz4KICA8dGV4dCBjbGFzcz0ibGgiIHg9IjE0NCIgeT0iMjY2IiB0ZXh0LWFuY2hvcj0iZW5kIiBmaWxsPSIjM0QzRDNBIj5GbG9hdCAoaHVsbCk8L3RleHQ+CiAgPHBhdGggY2xhc3M9ImxlYWRlciIgZD0iTTI1Niw0MTYgTDE1MCw0MTYiLz4KICA8Y2lyY2xlIGN4PSIyNTYiIGN5PSI0MTYiIHI9IjMiIGZpbGw9IiNFQUYxRjYiLz4KICA8dGV4dCBjbGFzcz0ibHciIHg9IjE0NCIgeT0iNDIwIiB0ZXh0LWFuY2hvcj0iZW5kIj5OZWNrPC90ZXh0PgogIDxwYXRoIGNsYXNzPSJsZWFkZXIiIGQ9Ik0yMTAsNDc2IEwxNTAsNDc2Ii8+CiAgPGNpcmNsZSBjeD0iMjEwIiBjeT0iNDc2IiByPSIzIiBmaWxsPSIjRUFGMUY2Ii8+CiAgPHRleHQgY2xhc3M9Imx3IiB4PSIxNDQiIHk9IjQ4MCIgdGV4dC1hbmNob3I9ImVuZCI+SW5lcnRpYSBtYXNzPC90ZXh0Pgo8L3N2Zz4K"
+)
+
+
+def _aero_schematic():
+    """Side-view schematic of the aero-loading scenario: cube float at the
+    waterline, slender mast, neck and inertia mass below; wind, vortex
+    shedding (cross-wind force shown out-of-page / into-page), gust drag,
+    and the splash zone. Embedded as an SVG image."""
+    return html.Img(
+        src="data:image/svg+xml;base64," + _AERO_SCHEMATIC_B64,
+        alt="Aerodynamic loading schematic",
+        style={'display': 'block', 'width': '100%', 'maxWidth': '720px',
+               'margin': '6px auto 30px auto'})
+
+
+def _tab_aero_body(d):
+    """Parameter-dependent body of the Aero Loading tab: the two-section
+    walkthrough (wind forcing -> structural response). Rebuilt by the
+    slider callback whenever a wind / mode parameter changes."""
+    w = d['wind']
+    p = d['params']
+
+    section_h = {'fontSize': '15px', 'fontWeight': '600',
+                 'color': COLORS['text'], 'margin': '8px 0 4px 0'}
+    body_text = {'fontSize': '13.5px', 'lineHeight': '1.65',
+                 'margin': '6px 0 14px 0'}
+    note_text = {'fontSize': '12.5px', 'lineHeight': '1.6',
+                 'margin': '0 0 10px 0'}
+
+    # --- adaptive mast interpretation: depends on f_shed vs f_mast ---
+    ratio = d['f_shed'] / d['f_mast']
+    if 0.85 <= ratio <= 1.18:
+        mast_line = (
+            f"- **Mast bending** is fast — natural frequency "
+            f"{d['f_mast']:.2f} Hz. The vortex-shedding frequency "
+            f"({d['f_shed']:.2f} Hz) sits right on it, so the response "
+            f"is a near-pure oscillation amplified by resonance — "
+            f"**vortex-induced vibration (VIV)**, amplification "
+            f"factor 1/(2ζ) = {1/(2*p['zeta_mast']):.0f}×. Lower the "
+            f"mast damping ζ and the peak grows sharply.")
+    elif 0.6 <= ratio <= 1.6:
+        mast_line = (
+            f"- **Mast bending** is fast — natural frequency "
+            f"{d['f_mast']:.2f} Hz. The vortex-shedding frequency "
+            f"({d['f_shed']:.2f} Hz) is near, but not on, the mast "
+            f"frequency — the mast is driven partly off-resonance, so "
+            f"the response is moderate. Move the two onto each other "
+            f"for full VIV.")
+    else:
+        mast_line = (
+            f"- **Mast bending** is fast — natural frequency "
+            f"{d['f_mast']:.2f} Hz. The vortex-shedding frequency "
+            f"({d['f_shed']:.2f} Hz) is well away from the mast "
+            f"frequency, so the mast is driven off-resonance and the "
+            f"response stays small — no VIV at this setting.")
+
+    return html.Div([
+        # ============ SECTION 1 — WIND FORCING ============
+        html.Div('1 — Wind forcing', style=section_h),
+        dcc.Markdown(
+            "Wind drag on a bluff body, and its split into a steady mean "
+            "and a fluctuating gust part (writing the wind speed as "
+            "$U = U_{\\text{mean}} + u'(t)$):",
+            mathjax=True, style=body_text),
+        latex_equation(
+            r'F_{\text{drag}} = \tfrac{1}{2}\,\rho_{\text{air}}\,C_d\,A\,U^2'),
+        latex_equation(
+            r'F_{\text{drag}} \approx \underbrace{\tfrac{1}{2}\rho C_d A\,'
+            r'U_{\text{mean}}^2}_{\text{steady mean}} \;+\; '
+            r'\underbrace{\rho C_d A\,U_{\text{mean}}\,u'"'"'(t)}'
+            r'_{\text{fluctuating gust}}'),
+        dcc.Markdown(
+            "The cross-wind vortex-shedding force, and the Strouhal "
+            "relation that sets its frequency:",
+            mathjax=True, style=body_text),
+        latex_equation(
+            r'F_{\text{vortex}}(t) = \tfrac{1}{2}\,\rho_{\text{air}}\,C_L\,'
+            r'A\,U^2\,\sin(2\pi f_s t)'),
+        latex_equation(r'f_s = St \cdot \dfrac{U}{D}'),
+
+        # ---- vortex shedding illustration + expandable explanation ----
+        html.Img(
+            src='/assets/vortex_shedding.jpg',
+            alt='Vortex shedding from a cylinder',
+            style={'display': 'block', 'width': '100%', 'maxWidth': '560px',
+                   'margin': '12px auto 3px auto'}),
+        html.Div(
+            ['Source: ',
+             html.A('mecaenterprises.com/take-vortex-shedding-seriously',
+                    href='https://www.mecaenterprises.com/'
+                         'take-vortex-shedding-seriously/',
+                    target='_blank',
+                    style={'color': COLORS['text_dim']})],
+            style={'fontSize': '11px', 'color': COLORS['text_dim'],
+                   'textAlign': 'center', 'margin': '0 0 14px 0'}),
+        expandable_note('What is vortex shedding?', html.Div([
+            dcc.Markdown(
+                "When wind flows past a cylinder — such as the mast — the "
+                "flow cannot stay attached to the back of the cylinder. It "
+                "separates and rolls up into swirling vortices. These "
+                "vortices do not form symmetrically: they peel off "
+                "alternately, first from one side, then the other, in a "
+                "steady rhythm.",
+                style=note_text),
+            dcc.Markdown(
+                "Each time a vortex sheds from one side, it briefly lowers "
+                "the pressure there and tugs the cylinder toward that "
+                "side. Because the vortices alternate, the cylinder feels "
+                "a regular force perpendicular to the wind — the "
+                "cross-wind force. This is different from drag, which acts "
+                "along the wind.",
+                style=note_text),
+            dcc.Markdown(
+                "The shedding frequency follows the Strouhal relation:",
+                style=note_text),
+            latex_equation(r'f_s = St \cdot U / D'),
+            dcc.Markdown(
+                "where U is the wind speed, D is the cylinder diameter, "
+                "and St is the Strouhal number — a dimensionless "
+                "constant, about 0.2 for a circular cylinder. So faster "
+                "wind, or a thinner cylinder, means faster shedding.",
+                style=note_text),
+        ])),
+
+        _aero_table(
+            ['Symbol', 'Value', 'Meaning'],
+            [['rho_air', f"{w['rho_air']:.1f} kg/m^3", 'air density'],
+             ['U_mean', f"{w['U_mean']:.0f} m/s", 'mean wind speed (slider)'],
+             ['C_d', f"{w['C_d']:.1f}", 'drag coefficient (bluff body)'],
+             ['A_float', f"{w['A_float']:.0f} m^2",
+              'projected area, above-water float'],
+             ['C_L', f"{w['C_L']:.1f}", 'transverse (lift) coefficient'],
+             ['D', f"{w['D_mast']:.1f} m", 'mast diameter'],
+             ['A_mast', f"{w['A_mast']:.0f} m^2", 'projected area of the mast'],
+             ['St', f"{w['St']:.1f}", 'Strouhal number'],
+             ['f_s', f"{w['f_shed']:.2f} Hz",
+              'vortex shedding frequency = St*U/D']]),
+
+        dcc.Markdown(
+            f"Putting the numbers in:\n\n"
+            f"- **Steady mean drag** — "
+            f"½ × {w['rho_air']:.1f} × {w['C_d']:.1f} × "
+            f"{w['A_float']:.0f} × {w['U_mean']:.0f}² ≈ "
+            f"**{w['F_drag_mean']:.0f} N**. A constant offset — it drives "
+            f"no dynamic response, so it is not modeled.\n"
+            f"- **Gust force** — scales with the wind-speed fluctuation "
+            f"u'(t). With turbulence around 2 m/s RMS, the fluctuating "
+            f"gust force is roughly **{w['gust_scale']*2/1000:.1f} kN "
+            f"RMS** — broadband and low-frequency.\n"
+            f"- **Vortex shedding frequency** — f_s = St·U/D = "
+            f"{w['St']:.1f} × {w['U_mean']:.0f} / {w['D_mast']:.1f} = "
+            f"**{w['f_shed']:.2f} Hz**.\n"
+            f"- **Vortex force amplitude** — "
+            f"½ × {w['rho_air']:.1f} × {w['C_L']:.1f} × "
+            f"{w['A_mast']:.0f} × {w['U_mean']:.0f}² ≈ "
+            f"**{w['F_vortex_amp']:.0f} N**.\n\n"
+            f"The figure shows each component in time (left) and "
+            f"frequency (right); dashed lines mark the two structural "
+            f"natural frequencies.",
+            style=body_text),
+        dcc.Graph(figure=_aero_fig_forcing(d),
+                  config={'displayModeBar': False}),
+
+        # ============ BRIDGE — FORCING TO RESPONSE ============
+        html.Div('From forcing to response', style=section_h),
+        dcc.Markdown(
+            "The wind forcing above is the **input**. Feeding it into "
+            "the equation of motion and solving gives the structural "
+            "**response**. The same forcing drives both modes — each "
+            "solved with its own mass, stiffness, and damping:",
+            style=body_text),
+        dcc.Graph(figure=_aero_fig_bridge(d),
+                  config={'displayModeBar': False}),
+
+        # ============ SECTION 2 — STRUCTURAL MODE RESPONSES ============
+        html.Div('2 — Structural mode responses', style=section_h),
+        dcc.Markdown(
+            "The structure can move in more than one way. Two modes "
+            "matter here: **heave** — the whole float bobbing vertically "
+            "— and **mast bending** — the slender mast flexing. Each is a "
+            "separate single-degree-of-freedom oscillator, with its own "
+            "mass, stiffness and damping, and therefore its own natural "
+            "frequency:",
+            mathjax=True, style=body_text),
+        latex_equation(r'm\,\ddot{x} + c\,\dot{x} + k\,x = F(t)'),
+        latex_equation(r'\omega_n = \sqrt{k/m} \qquad\qquad '
+                       r'\zeta = \dfrac{c}{2\sqrt{mk}}'),
+        dcc.Markdown(
+            "The frequency response — how much motion per unit force at "
+            "each frequency. Each mode has its **own** transfer function: "
+            "the equation form is the same, but heave and mast bending "
+            "have different mass, stiffness, and damping, so H(ω) peaks "
+            "at a different frequency for each.",
+            mathjax=True, style=body_text),
+        latex_equation(r'H(\omega) = \dfrac{1}{k - m\omega^2 + ic\omega}'),
+
+        _aero_table(
+            ['Parameter', 'Heave mode', 'Mast bending mode'],
+            [['Stiffness  k  (fixed)',
+              f"{p['k_heave']:,.0f} N/m", f"{p['k_mast']:,.0f} N/m"],
+             ['Natural frequency  f  (slider)',
+              f"{d['f_heave']:.3f} Hz", f"{d['f_mast']:.2f} Hz"],
+             ['Effective mass  m = k/omega_n^2  (derived)',
+              f"{p['m_heave']/1000:.1f} t", f"{p['m_mast']/1000:.1f} t"],
+             ['Damping ratio  zeta  (slider)',
+              f"{p['zeta_heave']:.3f}", f"{p['zeta_mast']:.3f}"],
+             ['Damping coefficient  c = 2*zeta*sqrt(mk)  (derived)',
+              f"{p['c_heave']:,.0f} N*s/m", f"{p['c_mast']:,.0f} N*s/m"]]),
+
+        dcc.Markdown(
+            "The same total wind forcing drives both modes; the figure "
+            "shows each response in time (left) and frequency (right).",
+            style=body_text),
+        dcc.Graph(figure=_aero_fig_responses(d),
+                  config={'displayModeBar': False}),
+        dcc.Markdown(
+            mast_line + "\n"
+            f"- **Heave** is slow — natural frequency "
+            f"{d['f_heave']:.3f} Hz. It responds to the low-frequency "
+            f"gust content and barely feels the {d['f_shed']:.2f} Hz "
+            f"vortex shedding. Adjusting the heave sliders moves its "
+            f"spectral peak, but the RMS changes only modestly — the "
+            f"broadband gust has no single frequency to resonate with, "
+            f"so there is no sharp peak to tune. That near-flat "
+            f"behaviour is itself the conclusion.\n\n"
+            f"Each mode filters out the part of the forcing near its own "
+            f"natural frequency — the spectra on the right make this "
+            f"explicit.",
+            style=body_text),
+
+        # ============ CLOSING ============
+        dcc.Markdown(
+            "**Why this matters for fleet engineering** — a production "
+            "fleet model would couple these aero modes with the "
+            "hydrodynamic modes, add aerodynamic damping, and feed the "
+            "resulting stress histories into fatigue prediction. "
+            "Decoupling aero and hydro is fine for first-pass design, but "
+            "at fleet scale the coupling matters for accurate fatigue and "
+            "energy-budget estimates. The splash zone — where waves run "
+            "up the float — is a separate, harder problem that needs CFD "
+            "rather than this reduced-order treatment.",
+            style={'fontSize': '13.5px', 'lineHeight': '1.65',
+                   'margin': '10px 0 0 0', 'color': COLORS['text_dim']}),
+    ])
+
+
+def tab_aero():
+    """Tab 6: Aerodynamic loading — wrapper with wind / mode sliders and a
+    dynamic container for the parameter-dependent walkthrough.
+
+    Five sliders move the wind speed and each mode's natural frequency /
+    damping. For both modes the stiffness is held fixed and the modal
+    mass follows from m = k / omega_n^2.
+    """
+    d_init = DATA['aero']
+
+    slider_box_style = {
+        'background': '#F5F5F0',
+        'border': f"1px solid {COLORS['border']}",
+        'borderRadius': '4px', 'padding': '14px 18px',
+        'margin': '0 0 20px 0',
+    }
+    slider_label_style = {
+        'fontSize': '12px', 'fontWeight': '600',
+        'color': COLORS['text_dim'], 'textTransform': 'uppercase',
+        'letterSpacing': '0.04em', 'margin': '0 0 6px 0',
+    }
+    group_label_style = {
+        'fontSize': '11px', 'fontWeight': '700',
+        'color': COLORS['accent'], 'textTransform': 'uppercase',
+        'letterSpacing': '0.06em', 'margin': '2px 0 8px 0',
+    }
+    row_style = {'display': 'flex', 'gap': '26px', 'flexWrap': 'wrap',
+                 'margin': '0 0 6px 0'}
+
+    def _slider_block(label_text, slider):
+        return html.Div([
+            html.Div(label_text, style=slider_label_style),
+            slider,
+        ], style={'flex': '1 1 0', 'minWidth': '210px'})
+
+    _tt = {'placement': 'bottom', 'always_visible': False}
+    sl_U = dcc.Slider(id='aero-U', min=4, max=20, step=2,
+                      value=d_init['wind']['U_mean'],
+                      marks={v: f'{v}' for v in [4, 8, 12, 16, 20]},
+                      tooltip=_tt)
+    sl_fh = dcc.Slider(id='aero-fh', min=0.05, max=0.40, step=0.025,
+                       value=d_init['f_heave'],
+                       marks={v: f'{v:.2f}' for v in [0.05, 0.15, 0.25, 0.40]},
+                       tooltip=_tt)
+    sl_zh = dcc.Slider(id='aero-zh', min=0.02, max=0.20, step=0.01,
+                       value=d_init['params']['zeta_heave'],
+                       marks={v: f'{v:.2f}' for v in [0.02, 0.08, 0.14, 0.20]},
+                       tooltip=_tt)
+    sl_fm = dcc.Slider(id='aero-fm', min=0.5, max=4.0, step=0.25,
+                       value=d_init['f_mast'],
+                       marks={v: f'{v:.1f}' for v in [0.5, 1.0, 2.0, 3.0, 4.0]},
+                       tooltip=_tt)
+    sl_zm = dcc.Slider(id='aero-zm', min=0.005, max=0.10, step=0.005,
+                       value=d_init['params']['zeta_mast'],
+                       marks={v: f'{v:.3f}' for v in [0.005, 0.04, 0.07, 0.10]},
+                       tooltip=_tt)
+
+    sliders_panel = html.Div([
+        html.Div('Wind', style=group_label_style),
+        html.Div([_slider_block('Mean wind speed  U  (m/s)', sl_U)],
+                 style=row_style),
+        html.Div('Heave mode  —  stiffness fixed, mass follows',
+                 style=group_label_style),
+        html.Div([
+            _slider_block('Natural frequency  f  (Hz)', sl_fh),
+            _slider_block('Damping ratio  ζ', sl_zh),
+        ], style=row_style),
+        html.Div('Mast bending mode  —  stiffness fixed, mass follows',
+                 style=group_label_style),
+        html.Div([
+            _slider_block('Natural frequency  f  (Hz)', sl_fm),
+            _slider_block('Damping ratio  ζ', sl_zm),
+        ], style=row_style),
+    ], style=slider_box_style)
+
+    return html.Div([
+        tab_header(
+            'Aero Loading — wind forcing on the above-water structure',
+            "- Wind on the above-water structure splits into two parts: "
+            "a broadband **gust** force (fluctuating drag), and a "
+            "narrowband **vortex-shedding** force (cross-wind, off the "
+            "mast).\n"
+            "- These drive two structural modes — the slow **heave** "
+            "mode and the fast **mast bending** mode. Each mode amplifies "
+            "the forcing near its own natural frequency: **slow gusts "
+            "drive heave**, **vortex shedding drives mast bending**.\n"
+            "- Use the sliders to move the vortex-shedding frequency and "
+            "the mode frequencies onto or off each other, and watch the "
+            "response change."
+        ),
+        _aero_schematic(),
+        sliders_panel,
+        dcc.Loading(
+            id='aero-loading', type='circle', color=COLORS['accent'],
+            children=html.Div(id='aero-output',
+                              children=_tab_aero_body(d_init)),
+        ),
+    ])
+# ========================================================================
 # APP LAYOUT
 # ========================================================================
 app = dash.Dash(
@@ -6636,6 +7276,7 @@ TABS = [
     {'label': 'Resonance',    'value': 'tab-3'},
     {'label': 'Pressure',     'value': 'tab-4'},
     {'label': 'ADCP',         'value': 'tab-5'},
+    {'label': 'Aero Loading', 'value': 'tab-6'},
 ]
 
 app.layout = html.Div([
@@ -6670,6 +7311,7 @@ def render_tab(tab_value):
         'tab-3': tab_strain,
         'tab-4': tab_pressure,
         'tab-5': tab_adcp,
+        'tab-6': tab_aero,
     }.get(tab_value, tab_overview)()
 
 
@@ -6798,6 +7440,29 @@ def update_adcp_output(M2, u0, Le, bbl, sc):
         surface_coupling=float(sc),
     )
     return _tab_adcp_body(d)
+
+
+# ----- Aero tab — 5 sliders drive wind forcing + structural response -----
+@callback(
+    Output('aero-output', 'children'),
+    [Input('aero-U',  'value'),
+     Input('aero-fh', 'value'),
+     Input('aero-zh', 'value'),
+     Input('aero-fm', 'value'),
+     Input('aero-zm', 'value')],
+)
+def update_aero_output(U, f_heave, zeta_heave, f_mast, zeta_mast):
+    """Re-run the wind-loading simulation with the slider values and
+    rebuild the Aero Loading tab body. For each mode the stiffness is
+    held fixed; the natural-frequency slider sets the modal mass."""
+    d = make_aero_data(
+        U_mean=float(U),
+        f_heave=float(f_heave),
+        zeta_heave=float(zeta_heave),
+        f_mast=float(f_mast),
+        zeta_mast=float(zeta_mast),
+    )
+    return _tab_aero_body(d)
 
 
 if __name__ == '__main__':
